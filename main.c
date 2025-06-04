@@ -5,9 +5,82 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include "filtros_img.h"
+#include <unistd.h>
 #include <mpi.h>
 
 #define MAX_IMAGENES 600
+
+void configure_threads_by_host() {
+    char hostname[1024];
+    gethostname(hostname, sizeof(hostname));
+
+    if (strstr(hostname, "master")) {
+        omp_set_num_threads(20);
+    } else if (strstr(hostname, "luis-QEMU-Virtual-Machine")) {
+        omp_set_num_threads(4);
+    } else if (strstr(hostname, "slave2")) {
+        omp_set_num_threads(4);
+    } else {
+        omp_set_num_threads(2); 
+
+    #pragma omp parallel
+    {
+        #pragma omp single
+        printf("Host %s usando %d hilos (OpenMP)\n", hostname, omp_get_num_threads());
+    }
+}
+
+void compare_execution_costs(double total_exec_time_seconds) {
+    double total_kwh_week = 13.559;
+
+    // Energy price in USD per kWh (with subsidy)
+    double cost_kwh_usd = 0.013;
+
+    // Annual maintenance cost (USD)
+    double annual_maintenance_usd = 78.17 + 62.53 + 20.84;
+
+    // Equipment cost (MXN)
+    double equipment_cost_mxn = 37429 + 11239 + 9709;
+    double exchange_rate = 19.0;
+    double equipment_cost_usd = equipment_cost_mxn / exchange_rate;
+
+    // AWS annual cost (fixed)
+    double aws_annual_cost_usd = 3047.16;
+
+    // Weekly execution time in seconds (8h/day * 5 days)
+    double seconds_per_week = 40.0 * 60.0 * 60.0;
+
+    // Energy consumed proportionally to execution time
+    double kwh_used = (total_exec_time_seconds / seconds_per_week) * total_kwh_week;
+    double local_energy_cost = kwh_used * cost_kwh_usd;
+
+    // Maintenance cost proportional to execution time
+    double proportional_maintenance = (annual_maintenance_usd / (365 * 24 * 3600)) * total_exec_time_seconds;
+    double local_total_cost = local_energy_cost + proportional_maintenance;
+    double annual_local_cost = local_total_cost * 16 * 5 * 4 * 12;
+    printf("\n--- Comparación de costos de ejecución ---\n");
+    printf("• Tiempo total de ejecución: %.2f segundos\n", total_exec_time_seconds);
+    printf("• Energía consumida localmente: %.6f kWh\n", kwh_used);
+    printf("• Costo energético local: $%.4f USD\n", local_energy_cost);
+    printf("• Costo de mantenimiento proporcional: $%.6f USD\n", proportional_maintenance);
+    printf("• Costo total de ejecución local: $%.6f USD\n", local_total_cost);
+    printf("• Costo anual del servicio AWS: $%.2f USD\n", aws_annual_cost_usd);
+    printf("• Costo anual local: $%.2f USD\n", annual_local_cost);
+
+    // Append to report
+    FILE* cost_file = fopen("./reporte_total.txt", "a");
+    if (cost_file) {
+        fprintf(cost_file, "\n=== Comparación de costos ===\n");
+        fprintf(cost_file, "Tiempo de ejecución (s): %.2f\n", total_exec_time_seconds);
+        fprintf(cost_file, "Consumo energético local (kWh): %.6f\n", kwh_used);
+        fprintf(cost_file, "Costo energético local (USD): %.4f\n", local_energy_cost);
+        fprintf(cost_file, "Costo de mantenimiento proporcional (USD): %.6f\n", proportional_maintenance);
+        fprintf(cost_file, "Costo total local (USD): %.6f\n", local_total_cost);
+        fprintf(cost_file, "Costo anual AWS (USD): %.2f\n", aws_annual_cost_usd);
+        fclose(cost_file);
+    }
+}
+
 
 int ends_with_bmp(const char* filename) {
     const char* ext = strrchr(filename, '.');
@@ -19,6 +92,8 @@ int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    configure_threads_by_host();
 
     const char* carpeta = "img";
     struct dirent* entry;
@@ -70,6 +145,9 @@ int main(int argc, char** argv) {
 
     #pragma omp parallel
     {
+        #pragma omp single
+        printf("Proceso %d usando %d hilos OpenMP\n", rank, omp_get_num_threads());
+
         #pragma omp for
         for (int i = rank; i < total; i += size) {
             const char* path = imagenes[i];
@@ -123,12 +201,13 @@ int main(int argc, char** argv) {
 
     double fin_local = omp_get_wtime();
     double tiempo_local = fin_local - inicio_local;
-    MPI_Barrier(MPI_COMM_WORLD);
-    double suma_tiempos = 0;
-    MPI_Reduce(&tiempo_local, &suma_tiempos, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    // Time of all processes
+    double tiempo_maximo = 0;
+    MPI_Reduce(&tiempo_local, &tiempo_maximo, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("\nTiempo total acumulado de todos los procesos: %.4f segundos\n", suma_tiempos);
+        printf("\nTiempo real de ejecución (mayor entre todos los procesos): %.4f segundos\n", tiempo_maximo);
 
         long long total_lecturas = 0;
         long long total_escrituras = 0;
@@ -158,7 +237,7 @@ int main(int argc, char** argv) {
         }
 
         long long instrucciones_totales = (total_lecturas + total_escrituras) * 20LL;
-        double tiempo_total = suma_tiempos;
+        double tiempo_total = tiempo_maximo;
         if (tiempo_total <= 0) tiempo_total = 1e-6;
 
         double mips_global = instrucciones_totales / (tiempo_total * 1e6);
@@ -167,15 +246,16 @@ int main(int argc, char** argv) {
 
         FILE* resumen = fopen("./reporte_total.txt", "w");
         if (resumen) {
-            fprintf(resumen, "Lecturas totales: %lld\n", total_lecturas);
-            fprintf(resumen, "Escrituras totales: %lld\n", total_escrituras);
-            fprintf(resumen, "Instrucciones totales: %lld\n", instrucciones_totales);
-            fprintf(resumen, "Tiempo total: %lf segundos\n", tiempo_total);
-            fprintf(resumen, "MIPS global: %lf\n", mips_global);
-            fprintf(resumen, "Bytes por segundo global: %lf\n", bytes_por_segundo_global);
+	    fprintf(resumen, "Instrucciones totales: %lf\n", (double)instrucciones_totales);
+	    fprintf(resumen, "Lecturas totales: %lf\n", (double)total_lecturas);
+	    fprintf(resumen, "Escrituras totales: %lf\n", (double)total_escrituras);
+	    fprintf(resumen, "Tiempo total: %lf segundos\n", tiempo_total);
+	    fprintf(resumen, "MIPS global: %.6e\n", mips_global);
+	    fprintf(resumen, "Bytes por segundo global: %.6e\n", bytes_por_segundo_global);
             fclose(resumen);
         }
 
+	compare_execution_costs(tiempo_maximo);
         printf("Reporte generado correctamente por el proceso 0.\n");
     }
 
